@@ -10,12 +10,12 @@
 
 ```bash
 echo 'yourpassword' > /etc/accel-ppp-radius.secret && chmod 600 /etc/accel-ppp-radius.secret
-```bash
+
 chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
-```bash
+
 chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
-```bash
+
 chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
-```bash
+
 chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
 ```
