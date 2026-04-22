@@ -1,72 +1,48 @@
 #!/bin/bash
 # =============================================================================
-# 🔵 Part 2 — ISP Monitoring Stack
-# accel-exporter  →  Prometheus  →  Grafana
-# Run AFTER part1-accel-ppp.sh has completed successfully.
+# Part 2 - ISP Monitoring Stack
+# accel-exporter -> Prometheus -> Grafana
+# Run AFTER part1 has completed successfully.
 # =============================================================================
 set -euo pipefail
 
 ############################
-# EDIT THESE IF NEEDED
-# (should match Part 1 values)
+# CONFIGURATION
 ############################
 LAN_IF="ens34"
 WAN_IF="ens33"
-IP_POOL_START="10.10.0.2"
-IP_POOL_END="10.10.50.254"
-GW_IP="10.10.0.1"
 WAN_UPLINK_MBIT=1000
-
-CPU_CORES=$(nproc)
-THREAD_COUNT=$(( CPU_CORES * 4 ))
-
-# Grafana admin password — CHANGE after first login
-GRAFANA_ADMIN_PASS="AccelPPP@ISP!"
-
-# Port accel-exporter listens on
+GRAFANA_ADMIN_PASS="AccelPPP-ISP-2024"
 EXPORTER_PORT=9101
-
-# Prometheus scrape bind (127.0.0.1 = local only; 0.0.0.0 = all interfaces)
-PROMETHEUS_BIND="127.0.0.1"
-
-# Management subnet allowed to access Grafana (port 3000) and Prometheus (port 9090)
-# Set to 0.0.0.0/0 to allow from anywhere, or e.g. 192.168.29.0/24 to restrict
 MGMT_SUBNET="0.0.0.0/0"
 
 ############################
-# PREFLIGHT CHECK
+# PREFLIGHT
 ############################
 if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: Run as root." >&2
-  exit 1
+  echo "ERROR: Run as root." >&2; exit 1
 fi
 
-# Warn if accel-ppp is not running
 if ! systemctl is-active --quiet accel-ppp 2>/dev/null; then
-  echo "⚠️  WARNING: accel-ppp service not running."
-  echo "   Run part1-accel-ppp.sh first, then re-run this script."
-  echo "   Continuing anyway — exporter will connect once accel-ppp starts."
-  sleep 3
+  echo "WARNING: accel-ppp not running. Continuing anyway..."
+  sleep 2
+fi
+
+if ! /usr/local/bin/accel-cmd show stat &>/dev/null; then
+  echo "WARNING: accel-cmd cannot reach localhost:2001"
+  echo "  Check [cli] section has: tcp=127.0.0.1:2001"
+  sleep 2
 fi
 
 ############################
-# ACCEL-EXPORTER
-# Prometheus exporter for Accel-PPP
-# Source: https://github.com/taihen/accel-exporter
-# Reads metrics via accel-cmd → exposes /metrics on :9101
+# INSTALL Go
 ############################
-
-echo ""
-echo ">>> Installing accel-exporter (Prometheus exporter)..."
-
-# Install Go from official source.
-# Ubuntu 22.04 ships Go 1.18 — too old. accel-exporter needs Go 1.21+
-# (uses the 'slices' stdlib package added in Go 1.21).
+echo ">>> Checking Go..."
 GO_VERSION="1.22.5"
 if /usr/local/go/bin/go version 2>/dev/null | grep -qE 'go1\.(2[1-9]|[3-9][0-9])'; then
-  echo ">>> Go already >= 1.21: $(/usr/local/go/bin/go version)"
+  echo ">>> Go OK: $(/usr/local/go/bin/go version)"
 else
-  echo ">>> Installing Go ${GO_VERSION} from golang.org..."
+  echo ">>> Installing Go ${GO_VERSION}..."
   cd /tmp
   curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o go.tar.gz
   rm -rf /usr/local/go
@@ -79,212 +55,147 @@ fi
 export PATH="/usr/local/go/bin:$PATH"
 export GOPATH="/root/go"
 export GOMODCACHE="/root/go/pkg/mod"
-cd /usr/src
 
-# Build accel-exporter from source
+############################
+# BUILD ACCEL-EXPORTER
+############################
+echo ">>> Building accel-exporter..."
 cd /usr/src
 if [ ! -d "accel-exporter" ]; then
   git clone https://github.com/taihen/accel-exporter.git
 fi
-
 cd accel-exporter
 git fetch origin
 git checkout main && git pull origin main
-echo ">>> accel-exporter commit: $(git rev-parse HEAD)"
-
-# Build the binary
+echo ">>> Commit: $(git rev-parse HEAD)"
 go build -o /usr/local/bin/accel-exporter ./cmd/accel-exporter/
 chmod 755 /usr/local/bin/accel-exporter
-
-# Dedicated unprivileged user for the exporter
-if ! id -u accel-exporter &>/dev/null; then
-  useradd --system --no-create-home --shell /usr/sbin/nologin accel-exporter
-fi
-
-# Give the exporter user access to the accel-ppp CLI socket
-# The socket is owned by root:root — add the user to the group,
-# or use a wrapper. Simplest: run exporter as root (or same user as accel-pppd).
-# For production: create a dedicated group and share the socket.
-usermod -aG root accel-exporter   # tighten this later if desired
-
-# Copy the Grafana dashboard to a known location
-DASHBOARD_DIR="/etc/accel-exporter/dashboards"
-mkdir -p "$DASHBOARD_DIR"
-if [ -f "/usr/src/accel-exporter/dashboards/dashboard.json" ]; then
-  cp /usr/src/accel-exporter/dashboards/*.json "$DASHBOARD_DIR/"
-  echo ">>> Grafana dashboard saved to: $DASHBOARD_DIR"
-fi
+echo ">>> accel-exporter built OK"
 
 ############################
-# ACCEL-EXPORTER SYSTEMD SERVICE
+# ACCEL-EXPORTER SERVICE
+# Uses -accel-cmd.path only (no socket flag in this version)
 ############################
-# NOTE: accel-cmd path after Accel-PPP install is /usr/local/sbin/accel-cmd
-# The exporter connects to the CLI socket we configured in [cli] section.
-# We pass --accel-cmd-path so it calls accel-cmd with the UNIX socket flag.
-
-ACCEL_CMD_PATH="/usr/local/sbin/accel-cmd"
-EXPORTER_LISTEN=":9101"
-EXPORTER_CLI_SOCK="/var/run/accel-ppp/cli.sock"
-
-cat > /etc/systemd/system/accel-exporter.service <<EOF
-[Unit]
+python3 - "${EXPORTER_PORT}" << 'PYEOF'
+import sys
+port = sys.argv[1]
+svc = f"""[Unit]
 Description=Accel-PPP Prometheus Exporter
 Documentation=https://github.com/taihen/accel-exporter
 After=network.target accel-ppp.service
 Requires=accel-ppp.service
 
 [Service]
-User=accel-exporter
-Group=root
-ExecStart=$ACCEL_CMD_PATH \
-  --accel-cmd-path=$ACCEL_CMD_PATH \
-  --accel-cmd-socket=$EXPORTER_CLI_SOCK \
-  --web.listen-address=$EXPORTER_LISTEN \
-  --web.telemetry-path=/metrics
+User=root
+ExecStart=/usr/local/bin/accel-exporter -accel-cmd.path=/usr/local/bin/accel-cmd -web.listen-address=:{port} -web.metrics-path=/metrics -log.level=info
 Restart=on-failure
 RestartSec=10s
-NoNewPrivileges=yes
-ProtectSystem=strict
-ReadOnlyPaths=/usr/local/sbin
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-EOF
+"""
+with open('/etc/systemd/system/accel-exporter.service', 'w') as f:
+    f.write(svc)
+print(">>> accel-exporter.service written")
+PYEOF
 
-# Fix: the binary to run is accel-exporter, not accel-cmd
-sed -i "s|ExecStart=$ACCEL_CMD_PATH|ExecStart=/usr/local/bin/accel-exporter|" \
-  /etc/systemd/system/accel-exporter.service
-
-############################
-# FIREWALL: allow Prometheus to scrape port 9101
-# ONLY from localhost or your Prometheus server IP
-# Change 127.0.0.1 to your Prometheus server IP if remote
-############################
-PROMETHEUS_IP="127.0.0.1"
-iptables -A INPUT -s "$PROMETHEUS_IP" -p tcp --dport 9101 -j ACCEPT
+# Firewall
+iptables -D INPUT -s 127.0.0.1 -p tcp --dport "${EXPORTER_PORT}" -j ACCEPT 2>/dev/null || true
+iptables -A INPUT -s 127.0.0.1 -p tcp --dport "${EXPORTER_PORT}" -j ACCEPT
 netfilter-persistent save
 
-############################
-# PROMETHEUS SCRAPE CONFIG HINT
-############################
-mkdir -p /etc/accel-exporter
-cat > /etc/accel-exporter/prometheus-scrape.yml <<EOF
-# Add this block to your Prometheus prometheus.yml under scrape_configs:
-scrape_configs:
-  - job_name: 'accel-ppp'
-    static_configs:
-      - targets: ['localhost:9101']
-    scrape_interval: 30s
-    scrape_timeout: 10s
-EOF
-
-############################
-# START EXPORTER
-############################
 systemctl daemon-reload
 systemctl enable accel-exporter
 systemctl restart accel-exporter
+sleep 4
 
-# ============================================================
-# PROMETHEUS INSTALL
-# Binary install from official GitHub releases (latest stable)
-# Runs as dedicated 'prometheus' user on port 9090
-# ============================================================
-echo ""
+echo ">>> Testing accel-exporter..."
+EXPORTER_OK=0
+for i in 1 2 3 4 5; do
+  if curl -sf "http://localhost:${EXPORTER_PORT}/metrics" 2>/dev/null | grep -q "^accel_"; then
+    echo ">>> accel-exporter OK - metrics flowing"
+    EXPORTER_OK=1
+    break
+  fi
+  echo "    ...waiting for exporter attempt ${i}/5"
+  sleep 3
+done
+if [ "$EXPORTER_OK" = "0" ]; then
+  echo ">>> WARNING: exporter not responding yet - continuing install"
+  echo "    Check later: journalctl -u accel-exporter -n 20"
+fi
+
+############################
+# PROMETHEUS
+############################
 echo ">>> Installing Prometheus..."
 
-# Fetch the latest stable release version dynamically
 PROM_VERSION=$(curl -s https://api.github.com/repos/prometheus/prometheus/releases/latest \
   | grep '"tag_name"' | sed 's/.*"v\([^"]*\)".*/\1/')
+# Fallback if API rate-limited or network issue
+if [ -z "${PROM_VERSION}" ]; then
+  echo ">>> WARNING: Could not fetch latest Prometheus version, using known stable"
+  PROM_VERSION="3.11.2"
+fi
+echo ">>> Prometheus version: ${PROM_VERSION}"
 
-echo ">>> Prometheus version: $PROM_VERSION"
-
-# Create prometheus user and directories
 useradd --system --no-create-home --shell /usr/sbin/nologin prometheus 2>/dev/null || true
 mkdir -p /etc/prometheus /var/lib/prometheus
 chown prometheus:prometheus /var/lib/prometheus
 
-# Download and extract into a fixed directory — avoids all versioned dirname guessing
-PROM_EXTRACT="/tmp/prometheus-extract"
-rm -rf "$PROM_EXTRACT"
-mkdir -p "$PROM_EXTRACT"
+PROM_EXTRACT="/tmp/prom-extract"
+rm -rf "${PROM_EXTRACT}" && mkdir -p "${PROM_EXTRACT}"
 cd /tmp
-
-echo ">>> Downloading Prometheus ${PROM_VERSION}..."
 curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
   -o prometheus.tar.gz
-
-# Extract stripping the top-level versioned directory — contents land directly in $PROM_EXTRACT
-tar -xzf prometheus.tar.gz --strip-components=1 -C "$PROM_EXTRACT"
+tar -xzf prometheus.tar.gz --strip-components=1 -C "${PROM_EXTRACT}"
 rm -f prometheus.tar.gz
 
-echo ">>> Extracted files:"
-ls "$PROM_EXTRACT"
-
-# Sanity check — make sure key files are present
-# Sanity check — only binaries required (consoles removed in Prometheus v3)
-for f in prometheus promtool; do
-  if [ ! -e "${PROM_EXTRACT}/${f}" ]; then
-    echo "ERROR: Missing expected file/dir after extract: ${PROM_EXTRACT}/${f}"
-    echo "Contents of ${PROM_EXTRACT}:"
-    ls -la "$PROM_EXTRACT"
-    exit 1
-  fi
-done
-
-# Install binaries and web assets
-cp "${PROM_EXTRACT}/prometheus"           /usr/local/bin/
-cp "${PROM_EXTRACT}/promtool"             /usr/local/bin/
-# consoles/ and console_libraries/ removed in Prometheus v3 — skip if absent
-[ -d "${PROM_EXTRACT}/consoles" ]          && cp -r "${PROM_EXTRACT}/consoles"          /etc/prometheus/
-[ -d "${PROM_EXTRACT}/console_libraries" ] && cp -r "${PROM_EXTRACT}/console_libraries" /etc/prometheus/
+cp "${PROM_EXTRACT}/prometheus" /usr/local/bin/
+cp "${PROM_EXTRACT}/promtool"   /usr/local/bin/
+[ -d "${PROM_EXTRACT}/consoles" ]          && cp -r "${PROM_EXTRACT}/consoles"          /etc/prometheus/ || true
+[ -d "${PROM_EXTRACT}/console_libraries" ] && cp -r "${PROM_EXTRACT}/console_libraries" /etc/prometheus/ || true
 chown -R prometheus:prometheus /etc/prometheus
 chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
-rm -rf "$PROM_EXTRACT"
-echo ">>> Prometheus binaries installed: $(prometheus --version 2>&1 | head -1)" 
+rm -rf "${PROM_EXTRACT}"
+/usr/local/bin/prometheus --version 2>&1 | head -1 | xargs -I{} echo ">>> {}" || echo ">>> prometheus installed"
 
-# -------------------------------------------------------
-# Prometheus config — scrapes accel-exporter on :9101
-# and also scrapes itself for meta-monitoring
-# -------------------------------------------------------
-cat > /etc/prometheus/prometheus.yml <<PROMCFG
-global:
+# Write prometheus.yml using python3 - no heredoc
+python3 - "${EXPORTER_PORT}" << 'PYEOF'
+import sys
+port = sys.argv[1]
+cfg = f"""global:
   scrape_interval:     15s
   evaluation_interval: 15s
   scrape_timeout:      10s
 
 scrape_configs:
-  # Prometheus self-monitoring
-  - job_name: 'prometheus'
+  - job_name: prometheus
     static_configs:
       - targets: ['localhost:9090']
 
-  # Accel-PPP metrics via accel-exporter
-  - job_name: 'accel-ppp'
+  - job_name: accel-ppp
     scrape_interval: 15s
     scrape_timeout:  10s
     static_configs:
-      - targets: ['localhost:9101']
+      - targets: ['localhost:{port}']
         labels:
-          instance: 'bras-01'
-          environment: 'production'
-
-  # Node metrics (optional — remove if not needed)
-  # - job_name: 'node'
-  #   static_configs:
-  #     - targets: ['localhost:9100']
-PROMCFG
+          instance: bras-01
+          environment: production
+"""
+with open('/etc/prometheus/prometheus.yml', 'w') as f:
+    f.write(cfg)
+print(">>> prometheus.yml written")
+PYEOF
 
 chown prometheus:prometheus /etc/prometheus/prometheus.yml
+/usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
 
-# Validate config
-promtool check config /etc/prometheus/prometheus.yml
-
-# Prometheus systemd service
-cat > /etc/systemd/system/prometheus.service <<EOF
-[Unit]
+# Write prometheus.service using python3
+python3 << 'PYEOF'
+svc = """[Unit]
 Description=Prometheus Monitoring
-Documentation=https://prometheus.io/docs/introduction/overview/
 After=network-online.target
 Wants=network-online.target
 
@@ -292,13 +203,11 @@ Wants=network-online.target
 User=prometheus
 Group=prometheus
 Type=simple
-ExecStart=/usr/local/bin/prometheus \\
-  --config.file=/etc/prometheus/prometheus.yml \\
-  --storage.tsdb.path=/var/lib/prometheus \\
-  --storage.tsdb.retention.time=30d \\
-  # --web.console.* flags removed — Prometheus v3 dropped console directories
-  # --web.console.* flags removed — Prometheus v3 dropped console directories
-  --web.listen-address=127.0.0.1:9090 \\
+ExecStart=/usr/local/bin/prometheus \
+  --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/var/lib/prometheus \
+  --storage.tsdb.retention.time=30d \
+  --web.listen-address=127.0.0.1:9090 \
   --web.enable-lifecycle
 Restart=on-failure
 RestartSec=5s
@@ -306,64 +215,54 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-EOF
+"""
+with open('/etc/systemd/system/prometheus.service', 'w') as f:
+    f.write(svc)
+print(">>> prometheus.service written")
+PYEOF
 
-# Allow Prometheus UI only from localhost (access via SSH tunnel or change to 0.0.0.0 if needed)
-# Open Prometheus to management subnet (default: all; restrict as needed)
-iptables -A INPUT -s "$MGMT_SUBNET" -p tcp --dport 9090 -j ACCEPT
+iptables -D INPUT -s "${MGMT_SUBNET}" -p tcp --dport 9090 -j ACCEPT 2>/dev/null || true
+iptables -A INPUT -s "${MGMT_SUBNET}" -p tcp --dport 9090 -j ACCEPT
 netfilter-persistent save
 
 systemctl daemon-reload
 systemctl enable prometheus
 systemctl restart prometheus
+echo ">>> Prometheus started"
 
-echo ">>> Prometheus started — http://localhost:9090"
-
-# ============================================================
-# GRAFANA INSTALL
-# Official APT repo — always installs latest stable OSS release
-# Runs on port 3000 with auto-provisioned datasource + dashboard
-# ============================================================
-echo ""
-echo ">>> Installing Grafana OSS..."
+############################
+# GRAFANA
+############################
+echo ">>> Installing Grafana..."
 
 apt-get install -y apt-transport-https software-properties-common wget curl
-
-# Import Grafana GPG key (official method from grafana.com/docs)
 mkdir -p /etc/apt/keyrings
 wget -q -O /etc/apt/keyrings/grafana.asc https://apt.grafana.com/gpg-full.key
 chmod 644 /etc/apt/keyrings/grafana.asc
-
-# Add stable repo
 echo "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main" \
   | tee /etc/apt/sources.list.d/grafana.list
-
-apt-get update
+apt-get update -q
 apt-get install -y grafana
 
-# -------------------------------------------------------
-# Grafana config: harden defaults
-# Listen on 0.0.0.0 so all interfaces are reachable
-# -------------------------------------------------------
-
-# Generate secret key before the heredoc ($(…) doesn't expand inside heredocs)
-GF_SECRET=$(openssl rand -hex 32)
-
-# Stop Grafana before writing config (avoids partial-write issues)
 systemctl stop grafana-server 2>/dev/null || true
 
-cat > /etc/grafana/grafana.ini <<GFINI
-[server]
+GF_SECRET=$(openssl rand -hex 32)
+
+# Write grafana.ini using python3 - handles all special chars safely
+python3 - "${GRAFANA_ADMIN_PASS}" "${GF_SECRET}" << 'PYEOF'
+import sys
+admin_pass = sys.argv[1]
+secret_key = sys.argv[2]
+cfg = f"""[server]
 http_addr = 0.0.0.0
 http_port = 3000
 domain = localhost
 root_url = %(protocol)s://%(domain)s:%(http_port)s/
 
 [security]
-# CHANGE THIS PASSWORD immediately after first login!
 admin_user = admin
-admin_password = ${GRAFANA_ADMIN_PASS}
-secret_key = ${GF_SECRET}
+admin_password = {admin_pass}
+secret_key = {secret_key}
 disable_gravatar = true
 cookie_secure = false
 cookie_samesite = lax
@@ -383,16 +282,16 @@ check_for_updates = true
 [log]
 mode = file
 level = warn
-GFINI
+"""
+with open('/etc/grafana/grafana.ini', 'w') as f:
+    f.write(cfg)
+print(">>> grafana.ini written")
+PYEOF
 
-echo ">>> Grafana config written (http_addr = 0.0.0.0, port 3000)"
-
-# -------------------------------------------------------
-# Grafana Provisioning — Prometheus datasource (auto-wired)
-# -------------------------------------------------------
+# Write datasource provisioning
 mkdir -p /etc/grafana/provisioning/datasources
-cat > /etc/grafana/provisioning/datasources/prometheus.yml <<DS
-apiVersion: 1
+python3 << 'PYEOF'
+cfg = """apiVersion: 1
 datasources:
   - name: Prometheus
     type: prometheus
@@ -403,215 +302,279 @@ datasources:
     jsonData:
       httpMethod: POST
       timeInterval: "15s"
-DS
+"""
+with open('/etc/grafana/provisioning/datasources/prometheus.yml', 'w') as f:
+    f.write(cfg)
+print(">>> datasource provisioning written")
+PYEOF
 
-# -------------------------------------------------------
-# Grafana Provisioning — Dashboard folder config
-# Grafana will auto-load any JSON files in the folder below
-# -------------------------------------------------------
+# Write dashboard provisioning
 mkdir -p /etc/grafana/provisioning/dashboards
 mkdir -p /var/lib/grafana/dashboards
-
-cat > /etc/grafana/provisioning/dashboards/accel-ppp.yml <<DBPROV
-apiVersion: 1
+python3 << 'PYEOF'
+cfg = """apiVersion: 1
 providers:
-  - name: 'Accel-PPP'
+  - name: Accel-PPP
     orgId: 1
-    folder: 'ISP / Accel-PPP'
+    folder: ISP / Accel-PPP
     type: file
     disableDeletion: false
     updateIntervalSeconds: 30
     allowUiUpdates: true
     options:
       path: /var/lib/grafana/dashboards
-DBPROV
+"""
+with open('/etc/grafana/provisioning/dashboards/accel-ppp.yml', 'w') as f:
+    f.write(cfg)
+print(">>> dashboard provisioning written")
+PYEOF
 
-# -------------------------------------------------------
-# Copy accel-exporter dashboard JSON (from repo clone)
-# and embed a built-in Accel-PPP dashboard as fallback
-# -------------------------------------------------------
+# Write Grafana dashboard JSON
+# All metric names verified from live accel-exporter output
+python3 << 'PYEOF'
+import json
 
-# Copy from repo if present
-if ls /usr/src/accel-exporter/dashboards/*.json 2>/dev/null; then
-  cp /usr/src/accel-exporter/dashboards/*.json /var/lib/grafana/dashboards/
-  echo ">>> Copied accel-exporter dashboards from repo"
-fi
-
-# Also write a comprehensive built-in Accel-PPP dashboard
-cat > /var/lib/grafana/dashboards/accel-ppp-bras.json <<'DASHEOF'
-{
+dashboard = {
   "title": "Accel-PPP BRAS Monitor",
-  "uid": "accel-ppp-bras",
+  "uid": "accel-ppp-bras-v3",
   "schemaVersion": 38,
-  "version": 1,
+  "version": 3,
   "refresh": "15s",
   "tags": ["accel-ppp", "isp", "pppoe"],
-  "time": { "from": "now-1h", "to": "now" },
+  "time": {"from": "now-1h", "to": "now"},
   "panels": [
-    {
-      "id": 1, "type": "stat", "title": "Active Sessions",
-      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
-        "thresholds": { "steps": [
-          { "color": "green", "value": null },
-          { "color": "yellow", "value": 5000 },
-          { "color": "red", "value": 9000 }
-        ]}
-      }},
-      "targets": [{ "datasource": "Prometheus",
-        "expr": "accel_ppp_sessions_active", "legendFormat": "Active" }]
-    },
-    {
-      "id": 2, "type": "stat", "title": "Total Sessions (lifetime)",
-      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
-      "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" }}},
-      "targets": [{ "datasource": "Prometheus",
-        "expr": "accel_ppp_sessions_total", "legendFormat": "Total" }]
-    },
-    {
-      "id": 3, "type": "stat", "title": "Session Errors",
-      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" },
-        "thresholds": { "steps": [
-          { "color": "green", "value": null },
-          { "color": "red", "value": 1 }
-        ]}
-      }},
-      "targets": [{ "datasource": "Prometheus",
-        "expr": "rate(accel_ppp_sessions_error_total[5m]) * 60", "legendFormat": "Errors/min" }]
-    },
-    {
-      "id": 4, "type": "stat", "title": "Uptime",
-      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
-      "fieldConfig": { "defaults": { "unit": "s" }},
-      "targets": [{ "datasource": "Prometheus",
-        "expr": "accel_ppp_uptime_seconds", "legendFormat": "Uptime" }]
-    },
-    {
-      "id": 5, "type": "timeseries", "title": "Sessions Over Time",
-      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
-      "fieldConfig": { "defaults": { "custom": { "lineWidth": 2 }}},
-      "targets": [
-        { "datasource": "Prometheus", "expr": "accel_ppp_sessions_active", "legendFormat": "Active Sessions" },
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_sessions_total[5m]) * 300", "legendFormat": "New Sessions/5m" }
-      ]
-    },
-    {
-      "id": 6, "type": "timeseries", "title": "Session Rate (connects/disconnects per min)",
-      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_sessions_total[1m]) * 60", "legendFormat": "Connect rate/min" },
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_sessions_finished_total[1m]) * 60", "legendFormat": "Disconnect rate/min" }
-      ]
-    },
-    {
-      "id": 7, "type": "timeseries", "title": "Traffic Throughput",
-      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 8 },
-      "fieldConfig": { "defaults": { "unit": "bps" }},
-      "targets": [
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_bytes_sent_total[1m]) * 8", "legendFormat": "TX (upload)" },
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_bytes_received_total[1m]) * 8", "legendFormat": "RX (download)" }
-      ]
-    },
-    {
-      "id": 8, "type": "timeseries", "title": "Packet Rate",
-      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
-      "fieldConfig": { "defaults": { "unit": "pps" }},
-      "targets": [
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_packets_sent_total[1m])", "legendFormat": "TX packets/s" },
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_packets_received_total[1m])", "legendFormat": "RX packets/s" }
-      ]
-    },
-    {
-      "id": 9, "type": "timeseries", "title": "RADIUS Auth (success / fail)",
-      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_radius_auth_success_total[1m]) * 60", "legendFormat": "Auth OK/min" },
-        { "datasource": "Prometheus", "expr": "rate(accel_ppp_radius_auth_failed_total[1m]) * 60", "legendFormat": "Auth FAIL/min" }
-      ]
-    }
+    {"id":1,"type":"stat","title":"Daemon Up",
+     "gridPos":{"x":0,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"UP","color":"green"}}}],"thresholds":{"steps":[{"color":"red","value":None},{"color":"green","value":1}]}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_up","legendFormat":"Status"}]},
+
+    {"id":2,"type":"stat","title":"Uptime",
+     "gridPos":{"x":3,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"unit":"s","color":{"mode":"fixed","fixedColor":"blue"}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_uptime_seconds","legendFormat":"Uptime"}]},
+
+    {"id":3,"type":"stat","title":"Active Sessions",
+     "gridPos":{"x":6,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"steps":[{"color":"green","value":None},{"color":"yellow","value":5000},{"color":"red","value":9000}]}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_sessions_active","legendFormat":"Active"}]},
+
+    {"id":4,"type":"stat","title":"PPPoE Active",
+     "gridPos":{"x":9,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"color":{"mode":"fixed","fixedColor":"green"}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_pppoe_active","legendFormat":"PPPoE"}]},
+
+    {"id":5,"type":"stat","title":"CPU Usage",
+     "gridPos":{"x":12,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"unit":"percent","thresholds":{"steps":[{"color":"green","value":None},{"color":"yellow","value":60},{"color":"red","value":85}]}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_cpu_usage_percent","legendFormat":"CPU%"}]},
+
+    {"id":6,"type":"stat","title":"Memory RSS",
+     "gridPos":{"x":15,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"unit":"bytes","color":{"mode":"fixed","fixedColor":"purple"}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_memory_rss_bytes","legendFormat":"RSS"}]},
+
+    {"id":7,"type":"stat","title":"RADIUS State",
+     "gridPos":{"x":18,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"mappings":[{"type":"value","options":{"0":{"text":"DOWN","color":"red"},"1":{"text":"ACTIVE","color":"green"}}}],"thresholds":{"steps":[{"color":"red","value":None},{"color":"green","value":1}]}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_radius_state","legendFormat":"{{server_ip}}"}]},
+
+    {"id":8,"type":"stat","title":"RADIUS Failures",
+     "gridPos":{"x":21,"y":0,"w":3,"h":4},
+     "fieldConfig":{"defaults":{"color":{"mode":"thresholds"},"thresholds":{"steps":[{"color":"green","value":None},{"color":"red","value":1}]}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_radius_fail_count_total","legendFormat":"{{server_ip}}"}]},
+
+    {"id":10,"type":"timeseries","title":"Sessions - Active / Starting / Finishing",
+     "gridPos":{"x":0,"y":4,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_sessions_active","legendFormat":"Active"},
+       {"datasource":"Prometheus","expr":"accel_sessions_starting","legendFormat":"Starting"},
+       {"datasource":"Prometheus","expr":"accel_sessions_finishing","legendFormat":"Finishing"}
+     ]},
+
+    {"id":11,"type":"timeseries","title":"PPPoE Packet Rates",
+     "gridPos":{"x":12,"y":4,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"unit":"pps","custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"rate(accel_pppoe_recv_padi_total[1m])","legendFormat":"PADI recv/s"},
+       {"datasource":"Prometheus","expr":"rate(accel_pppoe_sent_pado_total[1m])","legendFormat":"PADO sent/s"},
+       {"datasource":"Prometheus","expr":"rate(accel_pppoe_recv_padr_total[1m])","legendFormat":"PADR recv/s"},
+       {"datasource":"Prometheus","expr":"rate(accel_pppoe_sent_pads_total[1m])","legendFormat":"PADS sent/s"},
+       {"datasource":"Prometheus","expr":"rate(accel_pppoe_drop_padi_total[1m])","legendFormat":"PADI drop/s"}
+     ]},
+
+    {"id":12,"type":"timeseries","title":"CPU Usage %",
+     "gridPos":{"x":0,"y":12,"w":8,"h":7},
+     "fieldConfig":{"defaults":{"unit":"percent","min":0,"max":100,"custom":{"lineWidth":2},"thresholds":{"steps":[{"color":"green","value":None},{"color":"yellow","value":60},{"color":"red","value":85}]}}},
+     "targets":[{"datasource":"Prometheus","expr":"accel_cpu_usage_percent","legendFormat":"CPU%"}]},
+
+    {"id":13,"type":"timeseries","title":"Memory",
+     "gridPos":{"x":8,"y":12,"w":8,"h":7},
+     "fieldConfig":{"defaults":{"unit":"bytes","custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_memory_rss_bytes","legendFormat":"RSS"},
+       {"datasource":"Prometheus","expr":"accel_memory_virtual_bytes","legendFormat":"Virtual"}
+     ]},
+
+    {"id":14,"type":"timeseries","title":"Mempool",
+     "gridPos":{"x":16,"y":12,"w":8,"h":7},
+     "fieldConfig":{"defaults":{"unit":"bytes","custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_core_mempool_allocated_bytes","legendFormat":"Allocated"},
+       {"datasource":"Prometheus","expr":"accel_core_mempool_available_bytes","legendFormat":"Available"}
+     ]},
+
+    {"id":20,"type":"timeseries","title":"Core Threads",
+     "gridPos":{"x":0,"y":19,"w":8,"h":7},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_core_thread_count","legendFormat":"Total"},
+       {"datasource":"Prometheus","expr":"accel_core_thread_active","legendFormat":"Active"}
+     ]},
+
+    {"id":21,"type":"timeseries","title":"Core Contexts",
+     "gridPos":{"x":8,"y":19,"w":8,"h":7},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_core_context_count","legendFormat":"Total"},
+       {"datasource":"Prometheus","expr":"accel_core_context_sleeping","legendFormat":"Sleeping"},
+       {"datasource":"Prometheus","expr":"accel_core_context_pending","legendFormat":"Pending"}
+     ]},
+
+    {"id":22,"type":"timeseries","title":"MD Handlers and Timers",
+     "gridPos":{"x":16,"y":19,"w":8,"h":7},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_core_md_handler_count","legendFormat":"MD handlers"},
+       {"datasource":"Prometheus","expr":"accel_core_md_handler_pending","legendFormat":"MD pending"},
+       {"datasource":"Prometheus","expr":"accel_core_timer_count","legendFormat":"Timers"},
+       {"datasource":"Prometheus","expr":"accel_core_timer_pending","legendFormat":"Timer pending"}
+     ]},
+
+    {"id":30,"type":"timeseries","title":"RADIUS Auth Sent / Lost",
+     "gridPos":{"x":0,"y":26,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"rate(accel_radius_auth_sent_total[1m])*60","legendFormat":"Sent/min {{server_ip}}"},
+       {"datasource":"Prometheus","expr":"rate(accel_radius_auth_lost_total[1m])*60","legendFormat":"Lost/min {{server_ip}}"}
+     ]},
+
+    {"id":31,"type":"timeseries","title":"RADIUS Auth Response Time",
+     "gridPos":{"x":12,"y":26,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"unit":"s","custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_radius_auth_avg_time_1m_seconds","legendFormat":"Avg 1m {{server_ip}}"},
+       {"datasource":"Prometheus","expr":"accel_radius_auth_avg_time_5m_seconds","legendFormat":"Avg 5m {{server_ip}}"}
+     ]},
+
+    {"id":32,"type":"timeseries","title":"RADIUS Accounting Sent / Lost",
+     "gridPos":{"x":0,"y":34,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"rate(accel_radius_acct_sent_total[1m])*60","legendFormat":"Sent/min {{server_ip}}"},
+       {"datasource":"Prometheus","expr":"rate(accel_radius_acct_lost_total[1m])*60","legendFormat":"Lost/min {{server_ip}}"}
+     ]},
+
+    {"id":33,"type":"timeseries","title":"RADIUS Acct Response Time",
+     "gridPos":{"x":12,"y":34,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"unit":"s","custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_radius_acct_avg_time_1m_seconds","legendFormat":"Avg 1m {{server_ip}}"},
+       {"datasource":"Prometheus","expr":"accel_radius_acct_avg_time_5m_seconds","legendFormat":"Avg 5m {{server_ip}}"}
+     ]},
+
+    {"id":34,"type":"timeseries","title":"RADIUS Interim Sent / Lost",
+     "gridPos":{"x":0,"y":42,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"rate(accel_radius_interim_sent_total[1m])*60","legendFormat":"Sent/min {{server_ip}}"},
+       {"datasource":"Prometheus","expr":"rate(accel_radius_interim_lost_total[1m])*60","legendFormat":"Lost/min {{server_ip}}"}
+     ]},
+
+    {"id":35,"type":"timeseries","title":"RADIUS Queue and Requests",
+     "gridPos":{"x":12,"y":42,"w":12,"h":8},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":2}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_radius_queue_length","legendFormat":"Queue {{server_ip}}"},
+       {"datasource":"Prometheus","expr":"accel_radius_request_count","legendFormat":"Requests {{server_ip}}"}
+     ]},
+
+    {"id":40,"type":"timeseries","title":"PPPoE Discovery Totals",
+     "gridPos":{"x":0,"y":50,"w":24,"h":7},
+     "fieldConfig":{"defaults":{"custom":{"lineWidth":1}}},
+     "targets":[
+       {"datasource":"Prometheus","expr":"accel_pppoe_recv_padi_total","legendFormat":"PADI recv"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_sent_pado_total","legendFormat":"PADO sent"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_recv_padr_total","legendFormat":"PADR recv"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_sent_pads_total","legendFormat":"PADS sent"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_drop_padi_total","legendFormat":"PADI dropped"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_filtered_total","legendFormat":"Filtered"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_recv_padr_dup_total","legendFormat":"PADR dup"},
+       {"datasource":"Prometheus","expr":"accel_pppoe_delayed_pado","legendFormat":"Delayed PADO"}
+     ]}
   ]
 }
-DASHEOF
+
+with open('/var/lib/grafana/dashboards/accel-ppp-bras.json', 'w') as f:
+    json.dump(dashboard, f, indent=2)
+print(">>> Grafana dashboard JSON written")
+PYEOF
 
 chown -R grafana:grafana /var/lib/grafana/dashboards /etc/grafana/provisioning
 
-# -------------------------------------------------------
-# Firewall: open port 3000 BEFORE starting Grafana
-# -------------------------------------------------------
+# Firewall
 iptables -D INPUT -p tcp --dport 3000 -j ACCEPT 2>/dev/null || true
-iptables -D INPUT -s "$MGMT_SUBNET" -p tcp --dport 3000 -j ACCEPT 2>/dev/null || true
 iptables -I INPUT 1 -p tcp --dport 3000 -j ACCEPT
 netfilter-persistent save
-echo ">>> Port 3000 open in iptables"
 
-# -------------------------------------------------------
-# Start Grafana and wait until it is truly ready
-# -------------------------------------------------------
+############################
+# START GRAFANA
+############################
 systemctl daemon-reload
 systemctl enable grafana-server
 systemctl restart grafana-server
 
-echo ">>> Waiting for Grafana to become ready (max 120s)..."
+echo ">>> Waiting for Grafana (max 120s)..."
 GRAFANA_URL="http://localhost:3000"
-MAX_WAIT=120
 ELAPSED=0
-
 until curl -sf "${GRAFANA_URL}/api/health" > /dev/null 2>&1; do
-  sleep 3
-  ELAPSED=$((ELAPSED + 3))
-  echo "    ... waited ${ELAPSED}s"
-  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
-    echo "ERROR: Grafana did not start in ${MAX_WAIT}s"
-    systemctl status grafana-server --no-pager -l
+  sleep 3 || true; ELAPSED=$((ELAPSED+3))
+  echo "    ...${ELAPSED}s"
+  if [ "$ELAPSED" -ge 120 ]; then
+    echo "ERROR: Grafana did not start"
     journalctl -u grafana-server --no-pager -n 20
-    echo "Fix manually: systemctl restart grafana-server"
-    break
+    exit 1
   fi
 done
+echo ">>> Grafana UP"
 
-if curl -sf "${GRAFANA_URL}/api/health" > /dev/null 2>&1; then
-  echo ">>> Grafana is UP at ${GRAFANA_URL}"
+curl -sf -u "admin:${GRAFANA_ADMIN_PASS}" \
+  -X POST "${GRAFANA_URL}/api/admin/provisioning/dashboards/reload" > /dev/null 2>&1 \
+  && echo ">>> Dashboards provisioned" || true
 
-  # Verify Prometheus datasource
-  echo ">>> Testing Prometheus datasource..."
-  curl -sf -u "admin:${GRAFANA_ADMIN_PASS}"     -X POST -H "Content-Type: application/json"     "${GRAFANA_URL}/api/datasources/1/health" > /dev/null 2>&1     && echo ">>> Datasource OK"     || echo ">>> Datasource check skipped — Prometheus may still be starting"
+GF_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+  -u "admin:${GRAFANA_ADMIN_PASS}" "${GRAFANA_URL}/api/org")
+[ "$GF_HTTP" = "200" ] && echo ">>> Admin login OK" || echo ">>> Admin login HTTP: ${GF_HTTP}"
 
-  # Force provisioning reload so dashboards appear immediately
-  curl -sf -u "admin:${GRAFANA_ADMIN_PASS}"     -X POST "${GRAFANA_URL}/api/admin/provisioning/dashboards/reload" > /dev/null 2>&1     && echo ">>> Dashboards provisioned"     || echo ">>> Provisioning reload skipped"
-
-  # Confirm admin login works
-  GF_HTTP=$(curl -sf -o /dev/null -w "%{http_code}"     -u "admin:${GRAFANA_ADMIN_PASS}" "${GRAFANA_URL}/api/org")
-  if [ "$GF_HTTP" = "200" ]; then
-    echo ">>> Admin login confirmed OK"
-  else
-    echo ">>> Admin login returned HTTP ${GF_HTTP}"
-    echo "    Reset password: grafana-cli admin reset-admin-password '${GRAFANA_ADMIN_PASS}'"
-  fi
-fi
-
-# PART 2 COMPLETE
-# ============================================================
+############################
+# DONE
+############################
+SERVER_IP=$(hostname -I | awk '{print $1}')
 echo ""
 echo "================================================================"
-echo "  🔵  PART 2 COMPLETE — Monitoring Stack"
+echo "  PART 2 COMPLETE - Monitoring Stack"
 echo "================================================================"
 echo "  accel-exporter : http://localhost:${EXPORTER_PORT}/metrics"
-echo "  Prometheus     : http://${PROMETHEUS_BIND}:9090"
-echo "  Grafana        : http://$(hostname -I | awk '{print $1}'):3000"
+echo "  Prometheus     : http://localhost:9090"
+echo "  Grafana        : http://${SERVER_IP}:3000"
 echo "  Grafana login  : admin / ${GRAFANA_ADMIN_PASS}"
-echo "  Dashboard      : ISP / Accel-PPP  →  Accel-PPP BRAS Monitor"
+echo "  Dashboard      : ISP / Accel-PPP -> Accel-PPP BRAS Monitor"
 echo "================================================================"
 echo ""
-echo "👉 Verify all services:"
+echo "Verify:"
 echo "  systemctl status accel-exporter prometheus grafana-server"
-echo ""
-echo "👉 Quick checks:"
-echo "  curl -s http://localhost:${EXPORTER_PORT}/metrics | grep accel_ppp_sessions"
+echo "  curl -s http://localhost:${EXPORTER_PORT}/metrics | grep accel_sessions_active"
 echo "  curl -s http://localhost:9090/-/healthy"
 echo "  curl -s http://localhost:3000/api/health"
-echo ""
-echo "  ⚠️  Change Grafana password immediately after first login!"
-echo "  ⚠️  Restrict port 3000 in iptables to your management subnet:"
-echo "       iptables -I INPUT -p tcp --dport 3000 ! -s YOUR_MGMT_IP -j DROP"
+echo "  curl -s http://localhost:9090/api/v1/targets | python3 -m json.tool | grep health"
 echo "================================================================"
