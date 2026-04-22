@@ -11,11 +11,13 @@
 ```bash
 echo 'yourpassword' > /etc/accel-ppp-radius.secret && chmod 600 /etc/accel-ppp-radius.secret
 
-chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+chmod +x part1-core.sh && bash part1-core.sh
 
-chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+chmod +x part2-pro-graf.sh && bash part2-pro-graf.sh
 
-chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+chmod +x part3-nat-graf.sh && part3-nat-graf.sh
 
-chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+chmod +x part4-log-install.sh && bash part4-log-install.sh
+
+chmod +x part5-GenieACS.sh && bash part5-GenieACS.sh
 ```
