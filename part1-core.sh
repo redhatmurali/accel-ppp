@@ -516,7 +516,8 @@ systemctl restart accel-ppp
 sleep 3
 systemctl status accel-ppp --no-pager | head -5
 #=========================================================
-
+iptables -I INPUT -p tcp --dport 22 -j ACCEPT
+netfilter-persistent save
 # ============================================================
 # PART 1 COMPLETE
 # ============================================================
