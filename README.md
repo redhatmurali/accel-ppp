@@ -9,6 +9,13 @@
 ### 1Set RADIUS Secret
 
 ```bash
-echo 'yourpassword' > /etc/accel-ppp-radius.secret
-chmod 600 /etc/accel-ppp-radius.secret
+echo 'yourpassword' > /etc/accel-ppp-radius.secret && chmod 600 /etc/accel-ppp-radius.secret
+```
+chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+```
+chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+```
+chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
+```
+chmod +x accel-ppp-hardened-install.sh && bash accel-ppp-hardened-install.sh
 ```
