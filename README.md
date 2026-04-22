@@ -18,3 +18,20 @@ bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/ma
 bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/main/part5-GenieACS.sh)"
 
 ```
+
+```bash
+sysctl -w net.netfilter.nf_conntrack_max=4194304
+echo 1048576 > /sys/module/nf_conntrack/parameters/hashsize
+```
+
+```bash
+echo "net.netfilter.nf_conntrack_max=4194304" >> /etc/sysctl.conf
+sysctl -p
+
+echo "options nf_conntrack hashsize=1048576" > /etc/modprobe.d/nf_conntrack.conf
+```
+
+```bash
+cat /proc/sys/net/netfilter/nf_conntrack_max
+cat /sys/module/nf_conntrack/parameters/hashsize
+```
