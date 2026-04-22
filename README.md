@@ -6,7 +6,7 @@
 
 ## Installation Steps
 
-### 1Set RADIUS Secret
+### Set RADIUS Secret
 
 ```bash
 echo 'yourpassword' > /etc/accel-ppp-radius.secret && chmod 600 /etc/accel-ppp-radius.secret
