@@ -471,6 +471,51 @@ systemctl enable accel-ppp
 systemctl restart tc-qos
 systemctl restart accel-ppp
 
+#=========================================================
+# Fix 1 — Create /var/run/accel-ppp on boot automatically (systemd handles it)
+mkdir -p /etc/systemd/system/accel-ppp.service.d/
+cat > /etc/systemd/system/accel-ppp.service.d/runtime-dir.conf << 'EOF'
+[Service]
+RuntimeDirectory=accel-ppp
+RuntimeDirectoryMode=0750
+EOF
+
+# Fix 2 — Fix service dependencies so it waits for network properly
+cat > /etc/systemd/system/accel-ppp.service << 'EOF'
+[Unit]
+Description=Accel-PPP PPPoE Server
+After=network-online.target tc-qos.service
+Wants=network-online.target tc-qos.service
+
+[Service]
+RuntimeDirectory=accel-ppp
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/sbin/accel-pppd -c /etc/accel-ppp.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=60
+LimitNOFILE=1000000
+LimitNPROC=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Fix 3 — Enable network-online.target
+systemctl enable systemd-networkd-wait-online.service 2>/dev/null || true
+systemctl enable NetworkManager-wait-online.service 2>/dev/null || true
+
+# Fix 4 — Reload and enable everything
+systemctl daemon-reload
+systemctl enable tc-qos accel-ppp
+
+# Test with a reboot simulation
+systemctl restart tc-qos
+systemctl restart accel-ppp
+sleep 3
+systemctl status accel-ppp --no-pager | head -5
+#=========================================================
 
 # ============================================================
 # PART 1 COMPLETE
