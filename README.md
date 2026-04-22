@@ -11,13 +11,10 @@
 ```bash
 echo 'yourpassword' > /etc/accel-ppp-radius.secret && chmod 600 /etc/accel-ppp-radius.secret
 
-chmod +x part1-core.sh && bash part1-core.sh
+bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/main/part1-core.sh)"
+bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/main/part2-pro-graf.sh)"
+bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/main/part3-nat-graf.sh)"
+bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/main/part4-log-install.sh)"
+bash -c "$(wget -qO- https://raw.githubusercontent.com/redhatmurali/accel-ppp/main/part5-GenieACS.sh)"
 
-chmod +x part2-pro-graf.sh && bash part2-pro-graf.sh
-
-chmod +x part3-nat-graf.sh && part3-nat-graf.sh
-
-chmod +x part4-log-install.sh && bash part4-log-install.sh
-
-chmod +x part5-GenieACS.sh && bash part5-GenieACS.sh
 ```
